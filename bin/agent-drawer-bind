@@ -20,6 +20,9 @@ END="-- agent-drawer-bind-end"
 DEFAULT_KEY="SUPER + SHIFT + A"
 COMMAND="omarchy-shell -q agent-drawer drawerToggle"
 
+# How many of our own backups to keep beside bindings.lua.
+KEEP_BACKUPS=3
+
 # Records that the live binding is currently lifted for recording. A lifted
 # binding is invisible to the user: nothing says the shortcut is off, and only a
 # reload brings it back. If the panel goes away mid-recording — dismissed by a
@@ -134,6 +137,10 @@ normalise_key() {
 # shortcut off — so `$1` is checked for being present rather than for being
 # non-empty. Using ${1:-...} here would silently read the saved setting back and
 # rebind the very shortcut the user had just turned off.
+#
+# Callers must therefore invoke this as `wanted_key "$@"` or `wanted_key`, never
+# as `wanted_key "${1-}"`: the latter always supplies one argument, so a
+# subcommand called with no shortcut would be treated as an explicit blank.
 wanted_key() {
   if (( $# > 0 )); then
     printf '%s' "$1"
@@ -271,12 +278,27 @@ replace_block() {
   mv "$tmp" "$BINDINGS"
 }
 
+# Keep only the most recent few backups of our own making.
+#
+# bindings.lua usually lives in a dotfiles repo, so every backup written next to
+# it shows up as an untracked file there. One per shortcut change adds up fast,
+# and only the newest is ever useful: the one before it is what the failed-change
+# rollback above already restored.
+prune_backups() {
+  local -a old=()
+  mapfile -t old < <(ls -1t "$BINDINGS".bak.agent-drawer-* 2>/dev/null || true)
+  local keep
+  for keep in "${!old[@]}"; do
+    (( keep < KEEP_BACKUPS )) || rm -f "${old[$keep]}"
+  done
+}
+
 apply() {
   local want old body current backup errors
   # The panel passes the shortcut it just captured rather than making this read
   # it back: the settings write that persists it is a separate process, so
   # reading the file here would race it and bind the previous shortcut.
-  want=$(normalise_key "$(wanted_key "${1-}")")
+  want=$(normalise_key "$(wanted_key "$@")")
   old=$(current_key)
   body=$(render_body "$want" "$old")
   current=$(block_body)
@@ -291,6 +313,7 @@ apply() {
     backup="$BINDINGS.bak.agent-drawer-$(date +%s)"
     cp "$BINDINGS" "$backup"
     replace_block "$body"
+    prune_backups
   fi
 
   hyprctl reload >/dev/null 2>&1 || true
@@ -335,7 +358,7 @@ apply() {
 # running state.
 suspend() {
   local key
-  key=$(normalise_key "$(wanted_key "${1-}")")
+  key=$(normalise_key "$(wanted_key "$@")")
   if [[ -z $key ]]; then
     printf 'nothing bound'
     return 0
@@ -358,12 +381,30 @@ heal() {
   apply "$key" >/dev/null
 }
 
+# Whether a shortcut was given on the command line, and what it was.
+#
+# This has to be decided from the caller's own arguments before any of the
+# subcommands run. Forwarding "${2-}" through to them always looks like one
+# argument, even when it is empty, so "no shortcut given" and "switched off"
+# became indistinguishable and a bare `show` reported a working shortcut as off.
+if (( $# > 1 )); then
+  cli_key=$2
+  have_cli=1
+else
+  cli_key=""
+  have_cli=0
+fi
+
 case "${1:-apply}" in
-  apply) apply "${2-}" ;;
-  suspend) suspend "${2-}" ;;
+  apply) if (( have_cli )); then apply "$cli_key"; else apply; fi ;;
+  suspend) if (( have_cli )); then suspend "$cli_key"; else suspend; fi ;;
   heal) heal ;;
   show)
-    key=$(normalise_key "$(wanted_key "${2-}")")
+    if (( have_cli )); then
+      key=$(normalise_key "$cli_key")
+    else
+      key=$(normalise_key "$(desired_key)")
+    fi
     printf '%s' "${key:-none}"
     ;;
   *)
