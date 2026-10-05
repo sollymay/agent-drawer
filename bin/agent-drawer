@@ -1,0 +1,634 @@
+#!/bin/bash
+# agent-drawer — show, hide, or toggle the floating default-agent TUI.
+#
+# The drawer is a real terminal window (class org.omarchy.agent-drawer) running
+# the default agent. Hiding parks the window on an inactive special workspace
+# so the agent session stays alive but is not composited anywhere; showing
+# moves it back onto the active workspace and re-applies the drawer geometry.
+#
+# Usage:
+#   agent-drawer show | hide | toggle | restart | status | watch
+
+set -uo pipefail
+
+PLUGIN_ID="agent-drawer"
+APP_ID="org.omarchy.agent-drawer"
+GAP="${AGENT_DRAWER_GAP:-8}"
+LAUNCH_TIMEOUT="${AGENT_DRAWER_LAUNCH_TIMEOUT:-8}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# Serialises show and hide against each other. Clicking the bar button and the
+# dismiss watcher can both decide to hide from the same click, and two slides
+# writing the same window position fight each other into a visible stutter.
+TRANSITION_LOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/agent-drawer-transition.lock"
+
+# Slide durations in milliseconds. Opening is the slower of the two: the drawer
+# has further to travel and reads as arriving, where closing is a dismissal and
+# should not get in the way.
+OPEN_MS="${AGENT_DRAWER_OPEN_MS:-280}"
+CLOSE_MS="${AGENT_DRAWER_CLOSE_MS:-220}"
+
+# How far above the top of the screen the drawer parks before a slide. Enough to
+# clear the window and the shadow Hyprland draws around it, so nothing peeks in
+# at the top edge when the slide starts.
+OFFSCREEN_PAD="${AGENT_DRAWER_OFFSCREEN_PAD:-24}"
+
+# --------------------------------------------------------------------- helpers
+
+log() { printf 'agent-drawer: %s\n' "$*" >&2; }
+
+# Embed a value in a double-quoted Lua string literal.
+lua_str() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Hyprland's `dispatch` dispatcher evaluates its argument as a Lua expression
+# and wraps it in hl.dispatch(), so hl.dsp.*(...) runs. Using hyprctl eval or
+# repl instead leaves the dispatcher unexecuted.
+dsp() { hyprctl dispatch "$1" >/dev/null 2>&1; }
+
+# Two dispatches in one Hyprland batch, which applies both before the compositor
+# draws again.
+#
+# This exists for one transition: moving the drawer onto another workspace.
+# Hyprland clamps a window into the bounds of the workspace it arrives on, so
+# asking for an off-screen position there is not allowed -- the window would
+# land in the middle of the monitor. Batched, the shrink that hides it and the
+# move that parks it are applied together, so the clamped frame is never drawn
+# at full size.
+dsp2() { hyprctl --batch "dispatch $1; dispatch $2" >/dev/null 2>&1; }
+
+# Any number of dispatches in one Hyprland batch, applied together before the
+# compositor draws again. Staging needs this: a resize is anchored at the middle
+# of the window, so resizing and then moving in separate requests lets the
+# intermediate rectangle be drawn and sampled, which is a visible sideways jump
+# on the way into a slide.
+dsp_batch() {
+  local cmd="" arg
+  for arg in "$@"; do
+    [[ -n $cmd ]] && cmd+="; "
+    cmd+="dispatch $arg"
+  done
+  hyprctl --batch "$cmd" >/dev/null 2>&1
+}
+
+# Wait for a rectangle the compositor will actually report, so a slide never
+# starts from a layout that is still catching up. Best effort: on timeout the
+# slide starts from wherever the window really is, which is how this behaved
+# before, rather than the drawer refusing to open.
+await_rect() {
+  local addr="$1" wx="$2" wy="$3" ww="$4" wh="$5" rect waited=0
+  while ((waited < 400)); do
+    rect=$(window_rect "$addr")
+    if [[ -n $rect && $rect == "$wx $wy $ww $wh" ]]; then
+      return 0
+    fi
+    sleep 0.02
+    ((waited += 20))
+  done
+  log "staged rectangle did not settle; sliding from $rect instead of $wx $wy $ww $wh"
+  return 0
+}
+
+shell_cfg() { printf '%s/omarchy/shell.json' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+clients_json() { hyprctl clients -j 2>/dev/null; }
+
+monitors_json() { hyprctl monitors -j 2>/dev/null; }
+
+window_address() {
+  clients_json | jq -r --arg c "$APP_ID" '[.[] | select(.class == $c)] | .[0].address // empty' 2>/dev/null
+}
+
+activewindow_address() {
+  hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null
+}
+
+# The drawer's live rectangle as "X Y W H". Read rather than recomputed, because
+# a slide out has to start from wherever the window actually is: the user may
+# have moved or resized it since it was shown.
+window_rect() {
+  clients_json | jq -r --arg a "$1" \
+    '.[] | select(.address == $a) | "\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])"' 2>/dev/null | head -1
+}
+
+# The monitor the drawer should appear on: whatever is focused, else the first.
+focused_monitor() {
+  local name
+  name=$(monitors_json | jq -r '[.[] | select(.focused == true)] | .[0].name // empty' 2>/dev/null)
+  [[ -n $name ]] || name=$(monitors_json | jq -r '.[0].name // empty' 2>/dev/null)
+  printf '%s' "$name"
+}
+
+# The focused monitor, else the first, as one compact record.
+#
+# Every field this needs costs a `hyprctl monitors` fork otherwise, and the
+# checks that gate a transition add up: the drawer used to wait a fifth of a
+# second on queries before it started moving.
+focused_monitor_record() {
+  monitors_json | jq -c '[.[] | select(.focused == true)] as $f | ($f[0] // .[0])' 2>/dev/null
+}
+
+window_floating() {
+  local value
+  value=$(clients_json | jq -r --arg a "$1" '.[] | select(.address == $a) | .floating' 2>/dev/null | head -1)
+  [[ "$value" == "true" ]]
+}
+
+# The window's workspace id and top edge as "<ws-id> <y>", from one query.
+window_state() {
+  clients_json | jq -r --arg a "$1" \
+    '.[] | select(.address == $a) | "\(.workspace.id) \(.at[1])"' 2>/dev/null | head -1
+}
+
+window_ws_id() {
+  window_state "$1" | cut -d' ' -f1
+}
+
+window_y() {
+  window_state "$1" | cut -d' ' -f2
+}
+
+# A window is showing when it is on screen.
+#
+# On screen, rather than merely present: the drawer parks above the top edge
+# when it is hidden, and it is still mapped and still on the workspace the whole
+# time. Every check here wants "can the user see it", which is the position.
+window_visible() {
+  local addr="$1" rec top y
+  [[ -n $addr ]] || return 1
+  rec=$(focused_monitor_record)
+  [[ -n $rec && $rec != "null" ]] || return 1
+  read -r top < <(jq -rn --argjson m "$rec" '$m.y')
+  [[ -n $top ]] || return 1
+  y=$(window_y "$addr")
+  [[ -n $y ]] || return 1
+  ((y >= top))
+}
+
+# -------------------------------------------------------------------- geometry
+
+# Drawer size comes from the plugin's shell.json entry so the bar popup's
+# sliders and the keybinding agree. The keys match the plugin manifest schema
+# (drawerWidthPct/drawerHeightPct) and are percentages of whichever monitor the
+# drawer opens on, not pixels: one setting then reads the same on a laptop
+# panel and on a 4K display, and a panel swap needs no second slider.
+# AGENT_DRAWER_WIDTH_PCT/HEIGHT_PCT win over both.
+config_size() {
+  local cfg key env_name value
+  cfg=$(shell_cfg)
+  # Key and environment variable are listed together: deriving one from the
+  # other cannot work, because the names are not the same words.
+  for pair in "drawerWidthPct AGENT_DRAWER_WIDTH_PCT" "drawerHeightPct AGENT_DRAWER_HEIGHT_PCT"; do
+    key=${pair%% *}
+    env_name=${pair##* }
+    if [[ -n ${!env_name:-} ]]; then
+      value=${!env_name}
+    elif [[ -r $cfg ]]; then
+      value=$(jq -r --arg id "$PLUGIN_ID" --arg key "$key" '
+        [ .bar.layout // {} | .. | objects | select(.id? == $id) ]
+        | .[0][$key] // empty
+      ' "$cfg" 2>/dev/null)
+    else
+      value=""
+    fi
+    printf '%s=%s ' "$key" "$value"
+  done
+}
+
+# Bottom edge of the menubar, read from the bar's layer-shell surface so a
+# theme that scales the bar with the font still places the drawer correctly.
+bar_bottom() {
+  local line
+  line=$(hyprctl layers 2>/dev/null | grep 'namespace: omarchy-bar' | head -1)
+  local y h
+  y=$(sed -n 's/.*xywh: \(-*[0-9]*\) \(-*[0-9]*\) \(-*[0-9]*\) \(-*[0-9]*\).*/\2/p' <<<"$line")
+  h=$(sed -n 's/.*xywh: \(-*[0-9]*\) \(-*[0-9]*\) \(-*[0-9]*\) \(-*[0-9]*\).*/\4/p' <<<"$line")
+  [[ -n $y && -n $h ]] || return 1
+  printf '%s' "$((y + h))"
+}
+
+clamp() {
+  local value="$1" lo="$2" hi="$3"
+  ((value < lo)) && value=$lo
+  ((value > hi)) && value=$hi
+  printf '%s' "$value"
+}
+
+# Prints "X Y W H" in global layout coordinates.
+drawer_geometry() {
+  local mon=$1
+  local mx my mw mh
+  # One query for four fields: each field would otherwise cost a fork of its
+  # own, and this runs on every open.
+  read -r mx my mw mh < <(monitors_json | jq -r \
+    --arg m "$mon" '(.[] | select(.name == $m) | "\(.x) \(.y) \(.width) \(.height)") // empty' 2>/dev/null)
+  [[ -n $mx && -n $my && -n $mw && -n $mh && $mw -gt 0 && $mh -gt 0 ]] || return 1
+
+  local top
+  top=$(bar_bottom) || top=$((my + 26))
+  top=$((top + GAP))
+
+  local sizes cfg_w cfg_h pct_w pct_h width height
+  sizes=$(config_size)
+  local cfg_w="" cfg_h=""
+  [[ $sizes =~ drawerWidthPct=([0-9]*) ]] && cfg_w="${BASH_REMATCH[1]}"
+  [[ $sizes =~ drawerHeightPct=([0-9]*) ]] && cfg_h="${BASH_REMATCH[1]}"
+
+  # The sliders run 10..100, so a value outside that is a hand-edited config
+  # rather than a choice: clamp it instead of letting a stray 0 collapse the
+  # drawer or a stray 400 run it off the monitor.
+  pct_w=$(clamp "${cfg_w:-44}" 10 100)
+  pct_h=$(clamp "${cfg_h:-50}" 10 100)
+
+  width=$((mw * pct_w / 100))
+  height=$((mh * pct_h / 100))
+
+  # A floor, not a preference: below this a terminal has no usable columns, and
+  # the percentage is the user's call above it. Keep the drawer off the bar and
+  # inside the monitor, which is also what 100% means here.
+  width=$(clamp "$width" 200 $((mw - 2 * GAP)))
+  height=$(clamp "$height" 120 $((mh - 2 * GAP)))
+
+  # Keep it on screen: never overlap the menubar, never run past the edge.
+  ((top < my + GAP)) && top=$((my + GAP))
+  ((height > my + mh - GAP - top)) && height=$((my + mh - GAP - top))
+  ((height < 200)) && height=200
+
+  local x=$((mx + (mw - width) / 2))
+  local y=$top
+  printf '%s %s %s %s' "$x" "$y" "$width" "$height"
+}
+
+# ----------------------------------------------------------------------- state
+
+launch() {
+  # --inline makes omarchy-agent exec the agent directly rather than opening
+  # another terminal, and setsid detaches it so this script can return while the
+  # session keeps running under uwsm.
+  #
+  # 9>&- closes the transition lock in the child. setsid detaches the process but
+  # does not close descriptors, so the terminal would inherit the open file
+  # description and hold the flock for as long as the drawer exists -- which is
+  # to say forever, and every later transition would time out waiting for it.
+  setsid uwsm-app -- xdg-terminal-exec --app-id="$APP_ID" -e omarchy-agent --inline \
+    >/dev/null 2>&1 9>&- &
+  disown 2>/dev/null || true
+}
+
+wait_for_window() {
+  local deadline=$((SECONDS + LAUNCH_TIMEOUT)) addr=""
+  while ((SECONDS < deadline)); do
+    addr=$(window_address)
+    [[ -n $addr ]] && { printf '%s' "$addr"; return 0; }
+    sleep 0.05
+  done
+  return 1
+}
+
+# Resolve the drawer rectangle before the window exists. Each piece of this
+# costs a hyprctl round trip plus some JSON work, so doing it after the window
+# maps would push the move past the end of the open animation and leave a
+# visible jump. Up front, only the wait and the three dispatches sit between
+# the window appearing and it being in its final place.
+plan_geometry() {
+  local mon
+  mon=$(focused_monitor)
+  drawer_geometry "$mon" || return 1
+}
+
+# The window rule already sets float = true at map time, so this is normally a
+# no-op. It only pays for a dispatch when something has tiled the window anyway.
+# `action` is numeric: 1 floats, 0 tiles. The string "set" is not recognised and
+# falls through to the default toggle, which is what turns an already-floating
+# drawer into a tiled one.
+float_window() {
+  local addr="$1"
+  window_floating "$addr" && return 0
+  dsp "hl.dsp.window.float({ action = 1, window = 'address:$(lua_str "$addr")' })"
+  sleep 0.25
+  window_floating "$addr" ||
+    dsp "hl.dsp.window.float({ action = 1, window = 'address:$(lua_str "$addr")' })"
+}
+
+# Drive the window from one vertical position to another over time.
+#
+# Hyprland will not do this itself. Its animations run on map and unmap, and the
+# drawer is never unmapped: hiding parks it on a special workspace so the agent
+# session survives, and moving a float between workspaces or positions draws
+# immediately. So the position is stepped here instead.
+#
+# Falls back to a single jump if the slider cannot run, so a failure costs the
+# animation and not the window's position.
+slide_window() {
+  local addr="$1" x="$2" from="$3" to="$4" ms="${5:-$OPEN_MS}"
+  [[ -n $addr && "$from" != "$to" ]] || return 0
+  "$SCRIPT_DIR/agent-drawer-slide" "$addr" "$x" "$from" "$to" "$ms" 2>/dev/null ||
+    dsp "hl.dsp.window.move({ x = $x, y = $to, window = 'address:$(lua_str "$addr")' })"
+}
+
+# Put the window on the current workspace, parked above the top edge, ready to
+# slide down.
+#
+# Hyprland clamps a floating window into the bounds of whatever workspace it is
+# in, so a window cannot rest off screen: ask for y=-1070 and it comes back at
+# y=29, sitting in plain view at the spot the slide is about to end at. That is
+# why the drawer is not parked on a workspace of its own between uses. Moving it
+# off screen is one dispatch that nothing clamps, and moving it back is the same
+# dispatch. Only a workspace change forces the clamp, and it forces it exactly
+# when the window lands on the visible workspace, where a frame of it is drawn.
+#
+# So the common case, drawer opened again on the workspace it was left on, is a
+# plain resize and a plain move. A workspace change still has to clamp once, and
+# shrinking the window first makes the clamped frame a speck in the corner
+# rather than the whole drawer appearing before it slides.
+stage_offscreen() {
+  local addr="$1" x="$2" y="$3" w="$4" h="$5"
+  local off=$((y - h - OFFSCREEN_PAD))
+
+  float_window "$addr"
+
+  local ws here
+  ws=$(focused_monitor_record | jq -r '.activeWorkspace.id // empty' 2>/dev/null)
+  here=$(window_ws_id "$addr")
+  [[ -n $ws && -n $here ]] || return 1
+
+  if [[ "$here" == "$ws" ]]; then
+    dsp_batch \
+      "hl.dsp.window.resize({ x = $w, y = $h, window = 'address:$(lua_str "$addr")' })" \
+      "hl.dsp.window.move({ x = $x, y = $off, window = 'address:$(lua_str "$addr")' })"
+    await_rect "$addr" "$x" "$off" "$w" "$h"
+    return 0
+  fi
+
+  # Left on another workspace. Shrink, bring it across without following, park
+  # it, then restore the size: at two pixels the clamped arrival is invisible.
+  # The final grow is batched with the move that places it, because that resize
+  # is anchored at the middle, so on its own it would leave the window off
+  # screen somewhere other than where the slide expects to start.
+  dsp "hl.dsp.window.resize({ x = 2, y = 2, window = 'address:$(lua_str "$addr")' })"
+  dsp2 \
+    "hl.dsp.window.move({ workspace = '$ws', follow = false, window = 'address:$(lua_str "$addr")' })" \
+    "hl.dsp.window.move({ x = $x, y = $off, window = 'address:$(lua_str "$addr")' })"
+  dsp_batch \
+    "hl.dsp.window.resize({ x = $w, y = $h, window = 'address:$(lua_str "$addr")' })" \
+    "hl.dsp.window.move({ x = $x, y = $off, window = 'address:$(lua_str "$addr")' })"
+  await_rect "$addr" "$x" "$off" "$w" "$h"
+}
+
+# The address that had focus before the drawer took it, so hiding can hand it
+# back. Kept in a file because the show and the hide are separate short-lived
+# processes, and because the bar, the keybinding and the dismiss watcher each
+# run their own.
+focus_memory() { printf '%s' "${XDG_RUNTIME_DIR:-/run/user/$UID}/agent-drawer-focus"; }
+
+remember_focus() {
+  local addr="$1" other
+  [[ -n $addr ]] || return 0
+  other=$(activewindow_address)
+  [[ -n $other && "$other" != "$addr" ]] || return 0
+  printf '%s' "$other" >"$(focus_memory)" 2>/dev/null || true
+}
+
+# Hand focus back to whatever held it before the drawer was shown.
+#
+# The drawer parks off screen but stays mapped, so leaving focus on it would
+# swallow keystrokes into a window nobody can see.
+restore_focus() {
+  local addr="$1" previous
+  previous=$(cat "$(focus_memory)" 2>/dev/null)
+  rm -f "$(focus_memory)" 2>/dev/null || true
+  [[ -n $previous && -n $addr && "$previous" != "$addr" ]] || return 0
+  # Only if the drawer still holds focus: the user may have clicked somewhere
+  # else in the meantime, and pulling focus back would be rude.
+  [[ $(activewindow_address) == "$addr" ]] || return 0
+  dsp "hl.dsp.focus({ window = 'address:$(lua_str "$previous")' })"
+}
+
+show() { (
+  flock -w 5 9 || { log "another transition is still running"; return 1; }
+  show_locked "$@"
+) 9>"$TRANSITION_LOCK"; }
+
+show_locked() {
+  local addr geometry x y w h
+  geometry=$(plan_geometry) || return 1
+  read -r x y w h <<<"$geometry"
+
+  addr=$(window_address)
+  if [[ -n $addr ]] && window_visible "$addr"; then
+    # Already open. Replaying the slide would yank it off screen and bring it
+    # back for no reason, so just take the focus.
+    dsp "hl.dsp.focus({ window = 'address:$(lua_str "$addr")' })"
+    printf '%s' "$addr"
+    return 0
+  fi
+
+  if [[ -z $addr ]]; then
+    launch
+    addr=$(wait_for_window) || {
+      log "the agent window did not appear within ${LAUNCH_TIMEOUT}s"
+      return 1
+    }
+  fi
+
+  remember_focus "$addr"
+  stage_offscreen "$addr" "$x" "$y" "$w" "$h" || return 1
+
+  dsp "hl.dsp.focus({ window = 'address:$(lua_str "$addr")' })"
+  slide_window "$addr" "$x" "$((y - h - OFFSCREEN_PAD))" "$y" "$OPEN_MS"
+  printf '%s' "$addr"
+}
+
+hide() { (
+  flock -w 5 9 || return 0
+  hide_locked "$@"
+) 9>"$TRANSITION_LOCK"; }
+
+hide_locked() {
+  local addr rect x y w h
+  addr=$(window_address)
+  [[ -n $addr ]] || return 0
+  window_visible "$addr" || return 0
+
+  # Straight up and off screen, and that is the whole transition. There is no
+  # second step to park it somewhere afterwards, so there is no second step to
+  # jump.
+  if rect=$(window_rect "$addr") && [[ -n $rect ]]; then
+    read -r x y w h <<<"$rect"
+    slide_window "$addr" "$x" "$y" "$((y - h - OFFSCREEN_PAD))" "$CLOSE_MS"
+  fi
+  restore_focus "$addr"
+}
+
+toggle() {
+  local addr
+  addr=$(window_address)
+  if [[ -n $addr ]] && window_visible "$addr"; then
+    hide
+    printf 'hidden\n'
+  else
+    show >/dev/null || return 1
+    printf 'shown\n'
+  fi
+}
+
+event_socket() {
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}"
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} && -S $dir/.socket2.sock ]] &&
+    printf '%s' "$dir/.socket2.sock"
+}
+
+# Hyprland emits no "clicked outside" event, so focus is the proxy: while the
+# drawer is on screen, focus moving to any other window means the pointer went
+# somewhere else. Keyboard focus switches dismiss it too, which is what a
+# drawer is expected to do anyway.
+#
+# The direct mechanism would be HyprlandFocusGrab, but it only accepts
+# Quickshell's own surfaces. A foreign toplevel is silently dropped from the
+# grab list, which would leave the grab empty and let the very first click
+# dismiss the drawer -- including a click inside the terminal itself.
+#
+# Only the 1 -> 0 edge dismisses, tracked in the watcher across events. The
+# event on its own is not a signal that the drawer was dismissed: bringing it
+# back from the hiding workspace makes Hyprland report whichever window was
+# focused before it, and that event lands while the drawer is already on the
+# active workspace. Judged on its own it hides the drawer a few milliseconds
+# into opening it. Asking Hyprland who holds focus now cannot work either, since
+# by the time the event is handled the focus has already left the drawer.
+#
+# `holder` is the watcher's memory of whether the drawer held focus. It is a
+# variable in the caller rather than an argument so the edge survives across
+# events.
+focus_left_drawer() {
+  local focused="$1" addr
+  addr=$(window_address)
+  [[ -n $addr ]] || return 0
+
+  # The socket reports a bare hex address; hyprctl reports it 0x-prefixed.
+  if [[ "0x$focused" == "$addr" ]]; then
+    holder=1
+    return 0
+  fi
+
+  ((holder)) || return 0
+  holder=0
+  # Already off screen: there is nothing to dismiss, and sliding a drawer nobody
+  # can see would only waste the animation.
+  window_visible "$addr" || return 0
+  hide
+}
+
+# Long-lived; the shell starts it alongside the agent window and stops it when
+# that window goes away.
+#
+# At most one runs at a time. Restarting the shell kills its children outright,
+# which orphans any watcher already running; without the lock those would pile
+# up, each holding its own socket connection and each re-checking the drawer on
+# every focus change. The incumbent is already doing the right job, so a
+# newcomer stands down rather than taking over.
+watch() {
+  local sock lock fifo reader event holder=0
+  sock=$(event_socket) || return 0
+  lock="${XDG_RUNTIME_DIR:-/run/user/$UID}/agent-drawer-watch.lock"
+  exec 9>"$lock" || return 0
+  flock -n 9 || return 0
+
+  # socat writes to a fifo this shell reads, rather than a pipe or process
+  # substitution. Either of those forks a helper that inherits the lock
+  # descriptor, and an inherited copy keeps the lock held after this shell
+  # exits -- locking every future watcher out for good. 9>&- closes it here,
+  # and a plain background job gives the reader a pid the trap can stop.
+  #
+  # The fifo name carries the pid because a shared one is a trap: the next
+  # watcher to start unlinks and recreates it, and the watcher already reading
+  # it is left holding the old, unlinked inode. It then sits there receiving
+  # nothing and never notices.
+  fifo="$lock.fifo.$$"
+  rm -f "$fifo"
+  mkfifo "$fifo" || return 0
+  # A watcher killed outright never runs its trap, so its fifo is still here.
+  # Holding the lock means any other one is gone for good. The name has to be
+  # the basename: find -name never matches a path, and asking it to exclude
+  # this fifo by its full path silently excludes nothing and deletes this one.
+  find "${fifo%.*}"* -maxdepth 0 -type p ! -name "${fifo##*/}" -delete 2>/dev/null
+
+  socat -u "UNIX-CONNECT:$sock" - 9>&- >"$fifo" 2>/dev/null &
+  reader=$!
+  # Expanded now, on purpose. A single-quoted trap would look $reader up when
+  # it fires, by which point the function's locals are gone and `set -u` kills
+  # the trap before it can stop socat.
+  #
+  # SIGTERM matters more than EXIT here. The shell stops this watcher by
+  # signalling it, and a signalled bash skips the EXIT trap, which would strand
+  # socat on the event socket every time.
+  trap "kill $reader 2>/dev/null; rm -f '$fifo'" EXIT INT TERM HUP
+
+  # Open the fifo read-write, once, and keep it on fd 8 for the whole loop.
+  #
+  # `while read <"$fifo"` looks equivalent but is not: it reopens the fifo on
+  # every iteration, so there is no reader at all while the body runs. Hiding
+  # spends a few hundred milliseconds inside hyprctl and jq, and socat's write
+  # into that gap fails with EPIPE -- socat dies, and every later focus change
+  # goes unseen, so the drawer only ever dismisses once. Holding fd 8 open means
+  # a writer never sees a closed pipe.
+  #
+  # <> rather than < so the open does not block waiting for a writer, and a
+  # reader-only fd would also make the writer block at startup.
+  exec 8<>"$fifo" || return 0
+
+  # Escaped because an unquoted >> in a case pattern reads as a redirect.
+  while IFS= read -r -u 8 event; do
+    case $event in
+      activewindowv2\>\>*) focus_left_drawer "${event#activewindowv2>>}" ;;
+      closewindow\>\>*) [[ -z $(window_address) ]] && exit 0 ;;
+    esac
+  done
+}
+
+restart() {
+  local addr
+  addr=$(window_address)
+  if [[ -n $addr ]]; then
+    dsp "hl.dsp.window.kill({ window = 'address:$(lua_str "$addr")' })"
+    sleep 0.5
+  fi
+  show >/dev/null || return 1
+  printf 'restarted\n'
+}
+
+status() {
+  local addr
+  addr=$(window_address)
+  if [[ -z $addr ]]; then
+    printf 'not-running\n'
+  elif window_visible "$addr"; then
+    printf 'visible %s\n' "$addr"
+  else
+    printf 'hidden %s\n' "$addr"
+  fi
+}
+
+case "${1:-toggle}" in
+show)
+  show >/dev/null && printf 'shown\n'
+  ;;
+hide)
+  hide
+  printf 'hidden\n'
+  ;;
+toggle)
+  toggle
+  ;;
+restart)
+  restart
+  ;;
+watch)
+  watch
+  ;;
+status)
+  status
+  ;;
+*)
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac

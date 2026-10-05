@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# Keep the drawer's toggle shortcut in step with the panel setting.
+#
+# Hyprland has no runtime equivalent of "remember this binding": `hyprctl
+# keyword bind` is session state that the next config reload silently drops, and
+# Omarchy reloads the Hyprland config on theme and monitor changes. So the
+# binding has to live in a config file to be durable, which means this script
+# owns a marked region of the user's bindings.lua rather than the binding
+# living in a file it has to keep rewriting.
+#
+# The region is delimited by marker comments, the same idiom already used in
+# that file for other plugins' shortcuts, so it is obvious what is generated and
+# safe to delete by hand.
+set -euo pipefail
+
+PLUGIN_ID="agent-drawer"
+BINDINGS="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
+START="-- agent-drawer-bind-start"
+END="-- agent-drawer-bind-end"
+DEFAULT_KEY="SUPER + SHIFT + A"
+COMMAND="omarchy-shell -q agent-drawer drawerToggle"
+
+# Records that the live binding is currently lifted for recording. A lifted
+# binding is invisible to the user: nothing says the shortcut is off, and only a
+# reload brings it back. If the panel goes away mid-recording — dismissed by a
+# click, a workspace change, or the panel simply closing — nothing would ever put
+# it back, so the fact is written down and `heal` uses it to recover.
+MARKER="${XDG_RUNTIME_DIR:-/tmp}/agent-drawer-bind-suspended"
+
+log() { printf '%s\n' "$*" >&2; }
+die() { printf 'agent-drawer-bind: %s\n' "$*" >&2; exit 1; }
+
+shell_cfg() { printf '%s/omarchy/shell.json' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+# The combo the panel last stored, which is what the binding should become.
+#
+# Absent means the default, so a fresh install gets a working shortcut without
+# having to save anything first.
+desired_key() {
+  local cfg value
+  cfg=$(shell_cfg)
+  if [[ -r $cfg ]]; then
+    value=$(jq -r --arg id "$PLUGIN_ID" '
+      [ .bar.layout // {} | .. | objects | select(.id? == $id) ]
+      | .[0].toggleKey // empty
+    ' "$cfg" 2>/dev/null || true)
+  fi
+  printf '%s' "${value:-$DEFAULT_KEY}"
+}
+
+# Turn whatever the setting holds into one canonical spelling, or print nothing
+# when the shortcut is switched off.
+#
+# Refusing anything outside this alphabet is not fussiness. The combo is
+# interpolated into a Lua string literal in a file Hyprland executes, so a
+# quote, a backslash or a newline in the setting would be a way to write
+# arbitrary config. Hyprland's own key names are all upper-case alphanumerics
+# and underscores, so nothing legitimate is turned away.
+normalise_key() {
+  local raw="$1" token key=""
+  local -A seen=()
+  local -a parts=()
+
+  # Trim before reading the empty/off words, so " none " means the same as
+  # "none" rather than becoming a key called NONE.
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+
+  case "${raw,,}" in
+    ""|off|none|disabled|-)
+      printf ''
+      return 0
+      ;;
+  esac
+
+  # read -ra stops at the first newline, so a value carrying one would be
+  # quietly truncated into something that looks accepted. Refuse it outright
+  # rather than binding half of what was asked for.
+  if [[ $raw == *$'\n'* || $raw == *$'\r'* ]]; then
+    die "a shortcut is a single line"
+  fi
+
+  # read -ra rather than a bare `for`: word splitting in a for-list re-globs,
+  # so a stray "*" would silently expand to a filename and then be judged on
+  # that name instead of being rejected.
+  IFS=$' \t+' read -ra parts <<<"${raw//+/ }" || true
+
+  for token in "${parts[@]}"; do
+    token="${token^^}"
+    [[ -n $token ]] || continue
+    case "$token" in
+      SUPER|META) seen[SUPER]=1 ;;
+      CTRL|CONTROL) seen[CTRL]=1 ;;
+      ALT) seen[ALT]=1 ;;
+      SHIFT) seen[SHIFT]=1 ;;
+      *)
+        if [[ -n $key ]]; then
+          die "'$raw' names more than one key ('$key' and '$token')"
+        fi
+        [[ $token =~ ^[A-Z0-9_-]+$ ]] || die "'$token' is not a key Hyprland would recognise"
+        key="$token"
+        ;;
+    esac
+  done
+
+  # Friendly spellings for the names people actually type.
+  case "$key" in
+    ESC) key=ESCAPE ;;
+    ENTER|RETURN) key=RETURN ;;
+    PGUP) key=PAGE_UP ;;
+    PGDOWN|PG_DOWN) key=PAGE_DOWN ;;
+    DEL) key=DELETE ;;
+    INS) key=INSERT ;;
+    MIN) key=MINUS ;;
+    SPC) key=SPACE ;;
+  esac
+
+  [[ -n $key ]] || die "'$raw' has modifiers but no key"
+
+  # Canonical order, so the same shortcut always renders the same way and
+  # rewriting an unchanged setting is a no-op.
+  local combo="" mod
+  for mod in SUPER CTRL ALT SHIFT; do
+    [[ -n ${seen[$mod]:-} ]] || continue
+    combo+="${combo:+ + }$mod"
+  done
+  printf '%s' "${combo:+$combo + }$key"
+}
+
+# The shortcut to act on: the caller's argument if there is one, otherwise the
+# saved setting.
+#
+# An explicitly empty argument is meaningful — it is how the panel switches the
+# shortcut off — so `$1` is checked for being present rather than for being
+# non-empty. Using ${1:-...} here would silently read the saved setting back and
+# rebind the very shortcut the user had just turned off.
+wanted_key() {
+  if (( $# > 0 )); then
+    printf '%s' "$1"
+  else
+    desired_key
+  fi
+}
+
+# Hyprland's own comma spelling, for comparing against `hyprctl binds`.
+hypr_key() {
+  local combo="$1" token
+  local -a parts=() out=()
+  IFS=$' \t+' read -ra parts <<<"${combo// +/ }" || true
+  for token in "${parts[@]}"; do
+    case "$token" in
+      SUPER|CTRL|ALT|SHIFT) out+=("$token") ;;
+      "") ;;
+      *) out+=("$token") ;;
+    esac
+  done
+  local IFS=,
+  printf '%s' "${out[*]}"
+}
+
+# The region body as it currently stands in the file. Markers are matched
+# loosely so a hand-added space cannot make the region invisible: appending a
+# second copy would bind the same action twice, and Hyprland runs both, so the
+# drawer would open and immediately close again.
+block_body() {
+  [[ -r $BINDINGS ]] || return 0
+  awk -v start="$START" -v end="$END" '
+    index($0, start) > 0 { inside = 1; next }
+    index($0, end) > 0   { inside = 0; next }
+    inside                { print }
+  ' "$BINDINGS" 2>/dev/null
+}
+
+# Whatever the managed region currently binds, so the old shortcut can be
+# released when it changes. Hyprland does not drop a binding on reload just
+# because the config no longer mentions it, so leaving this out would leave the
+# previous shortcut working forever.
+current_key() {
+  block_body | sed -n 's/^o\.bind("\(.*\)", "Agent Drawer".*/\1/p' | head -1
+}
+
+# The region body, without its markers, so it can be compared against what is
+# already in the file to decide whether anything needs rewriting.
+render_body() {
+  local new="$1" old="$2"
+  printf -- '-- Generated by the Agent Drawer panel. Edits inside this region are\n'
+  printf -- '-- replaced the next time the shortcut is changed.\n'
+  if [[ -z $new ]]; then
+    printf -- '-- The shortcut is switched off; no key is bound.\n'
+    [[ -n $old ]] && printf 'hl.unbind("%s")\n' "$old"
+  else
+    # Unbind the previous combo first, or a changed shortcut leaves the old one
+    # live. Then unbind the new one: Hyprland runs every bind that matches a
+    # key, so without this the drawer's action would fire alongside whatever
+    # else already owns the combo.
+    [[ -n $old && $old != "$new" ]] && printf 'hl.unbind("%s")\n' "$old"
+    printf 'hl.unbind("%s")\n' "$new"
+    printf 'o.bind("%s", "Agent Drawer", "%s")\n' "$new" "$COMMAND"
+  fi
+}
+
+# What currently owns this combo, so the panel can say what it is taking over.
+owner_of() {
+  local combo="$1" desc
+  [[ -n $combo ]] || return 0
+  desc=$(hyprctl binds -j 2>/dev/null |
+    jq -r --arg key "$(hypr_key "$combo")" --argjson mask "$(modmask_of "$combo")" '
+      [ .[]
+        | select((.modmask | tostring) == ($mask | tostring))
+        | select((.key | ascii_upcase) == ($key | split(",") | last | ascii_upcase))
+        | .description ]
+      | map(select(. != "" and . != null))
+      | unique | join(", ")
+    ' 2>/dev/null || true)
+  printf '%s' "$desc"
+}
+
+# The modifier mask Hyprland reports for a combo, so the search above can match
+# binds without guessing at the bit layout.
+modmask_of() {
+  local combo="$1" token mask=0
+  local -a parts=()
+  IFS=$' \t+' read -ra parts <<<"${combo// +/ }" || true
+  for token in "${parts[@]}"; do
+    case "$token" in
+      SUPER) mask=$((mask | 64)) ;;
+      SHIFT) mask=$((mask | 1)) ;;
+      CTRL) mask=$((mask | 4)) ;;
+      ALT) mask=$((mask | 8)) ;;
+    esac
+  done
+  printf '%s' "$mask"
+}
+
+replace_block() {
+  local body="$1" tmp
+  local has_start has_end
+  # The markers start with "--", so grep has to be told they are patterns.
+  has_start=$(grep -cF -e "$START" "$BINDINGS" || true)
+  has_end=$(grep -cF -e "$END" "$BINDINGS" || true)
+
+  if [[ $has_start -gt 0 && $has_end -gt 0 ]]; then
+    tmp=$(mktemp "${BINDINGS}.agent-drawer.XXXXXX")
+    awk -v start="$START" -v end="$END" -v body="$body" '
+      !done && index($0, start) > 0 {
+        print start
+        print body
+        print end
+        skip = 1; done = 1; next
+      }
+      skip && index($0, end) > 0 { skip = 0; next }
+      !skip { print }
+    ' "$BINDINGS" >"$tmp"
+    mv "$tmp" "$BINDINGS"
+    return 0
+  fi
+
+  if [[ $has_start -gt 0 || $has_end -gt 0 ]]; then
+    die "only one marker found in $BINDINGS; fix or remove it by hand"
+  fi
+
+  # First run: keep everything the user has and add the region at the end, so
+  # the binding lands after the defaults and after the other plugins' blocks.
+  tmp=$(mktemp "${BINDINGS}.agent-drawer.XXXXXX")
+  cat "$BINDINGS" >"$tmp"
+  {
+    printf '\n%s\n' "$START"
+    printf '%s\n' "$body"
+    printf '%s\n' "$END"
+  } >>"$tmp"
+  mv "$tmp" "$BINDINGS"
+}
+
+apply() {
+  local want old body current backup errors
+  # The panel passes the shortcut it just captured rather than making this read
+  # it back: the settings write that persists it is a separate process, so
+  # reading the file here would race it and bind the previous shortcut.
+  want=$(normalise_key "$(wanted_key "${1-}")")
+  old=$(current_key)
+  body=$(render_body "$want" "$old")
+  current=$(block_body)
+
+  if [[ -n $current && $current == "$body" ]]; then
+    # Nothing to rewrite, but Hyprland is reloaded anyway. Recording a shortcut
+    # lifts the current binding at runtime, and only a reload puts it back, so
+    # treating "the file is already right" as "there is nothing to do" would
+    # leave the shortcut dead after a cancelled recording.
+    backup=""
+  else
+    backup="$BINDINGS.bak.agent-drawer-$(date +%s)"
+    cp "$BINDINGS" "$backup"
+    replace_block "$body"
+  fi
+
+  hyprctl reload >/dev/null 2>&1 || true
+  sleep 1
+
+  errors=$(hyprctl configerrors 2>/dev/null | grep -c . || true)
+  if [[ ${errors:-0} -gt 0 ]]; then
+    # The generated block is what Hyprland is complaining about, so put the
+    # user's file back rather than leaving them with a broken config.
+    [[ -n $backup ]] && cp "$backup" "$BINDINGS"
+    hyprctl reload >/dev/null 2>&1 || true
+    die "Hyprland rejected the config ($errors error(s)); bindings.lua restored"
+  fi
+
+  # The binding is back in force, so there is nothing left to recover. This is
+  # only reached once Hyprland has accepted the config, so a failed apply leaves
+  # the marker in place for `heal` to retry.
+  rm -f "$MARKER"
+
+  if [[ -z $want ]]; then
+    printf 'disabled'
+    return 0
+  fi
+
+  local taken
+  taken=$(owner_of "$want")
+  if [[ -n $taken && $taken != "Agent Drawer" ]]; then
+    printf 'bound %s (was: %s)' "$want" "$taken"
+  else
+    printf 'bound %s' "$want"
+  fi
+}
+
+# Recording a new shortcut has one conflict worth handling: while the panel is
+# waiting for a key press, the shortcut currently in force would fire instead of
+# being delivered to the panel, so it is lifted for the duration.
+#
+# This has to be a runtime unbind rather than a rewrite of the config, because
+# a reload takes long enough to be felt. Hyprland's `keyword` route is refused by
+# the current parser, so the Lua API is used instead. Putting the binding back
+# is `apply`'s job, which rewrites the config properly rather than patching
+# running state.
+suspend() {
+  local key
+  key=$(normalise_key "$(wanted_key "${1-}")")
+  if [[ -z $key ]]; then
+    printf 'nothing bound'
+    return 0
+  fi
+  # The combo is interpolated into a Lua string, but only ever the canonical
+  # form built by normalise_key, which cannot contain a quote.
+  hyprctl eval "hl.unbind(\"$key\")" >/dev/null 2>&1 || true
+  printf '%s' "$key" >"$MARKER"
+  printf 'released %s' "$key"
+}
+
+# Put back a binding that a recording left lifted. Cheap to call: it does
+# nothing at all unless a recording is actually outstanding, so the panel can
+# run it whenever it opens or closes rather than having to track the state
+# itself.
+heal() {
+  [[ -e $MARKER ]] || return 0
+  local key
+  key=$(cat "$MARKER" 2>/dev/null || true)
+  apply "$key" >/dev/null
+}
+
+case "${1:-apply}" in
+  apply) apply "${2-}" ;;
+  suspend) suspend "${2-}" ;;
+  heal) heal ;;
+  show)
+    key=$(normalise_key "$(wanted_key "${2-}")")
+    printf '%s' "${key:-none}"
+    ;;
+  *)
+    die "usage: agent-drawer-bind [apply|suspend|heal|show] [shortcut]"
+    ;;
+esac

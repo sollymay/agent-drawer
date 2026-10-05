@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Slide a floating window between two vertical positions.
+
+Usage: agent-drawer-slide <address> <x> <from-y> <to-y> [duration-ms]
+
+The drawer's open and close are hand-animated rather than left to a Hyprland
+window rule. A compositor animation can only run on map and unmap, and the
+drawer is never unmapped: hiding parks it on a special workspace so the agent
+session survives. So the window stays mapped the whole time and the position is
+driven here instead.
+
+Each step goes straight to Hyprland's request socket rather than through
+hyprctl. A dispatch costs about 0.06 ms that way against roughly 10 ms for a
+hyprctl fork, which is the difference between a slide and a visible staircase.
+Hyprland answers one request per connection and then hangs up, so every step
+opens its own socket; it is cheap enough not to matter.
+
+The position is derived from elapsed time on every step rather than advanced by
+a fixed amount per step. Dispatches are not evenly spaced in practice, and
+accumulating that jitter into the position is what makes hand-rolled animations
+drift and finish late.
+"""
+
+import os
+import socket
+import sys
+import time
+
+# Roughly two steps per frame at 60Hz. Faster only queues positions the
+# compositor never draws; slower shows as a stutter.
+STEP_SECONDS = 0.008
+
+
+def ease(t):
+  """Ease in and out, so the window leaves and arrives gently."""
+  return 4 * t**3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2
+
+
+def request_socket_path():
+  signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+  if not signature:
+    return None
+  runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+  return f"{runtime}/hypr/{signature}/.socket.sock"
+
+
+class Dispatcher:
+  """One Hyprland dispatch per connection; the server closes it afterwards."""
+
+  def __init__(self, path):
+    self.path = path
+
+  def __call__(self, command):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+      sock.connect(self.path)
+      sock.sendall(f"dispatch {command}".encode())
+      # The reply is a bare "ok". Reading it is not required to have the
+      # dispatch applied, and not reading it keeps a failed slide from
+      # stalling on a compositor that has gone away.
+      sock.settimeout(0.5)
+      try:
+        sock.recv(64)
+      except socket.timeout:
+        pass
+    except OSError:
+      return False
+    finally:
+      sock.close()
+    return True
+
+
+def slide(dispatch, address, x, from_y, to_y, duration_ms):
+  start = time.monotonic()
+  duration = duration_ms / 1000
+  span = to_y - from_y
+  steps = 0
+
+  while True:
+    elapsed = time.monotonic() - start
+    progress = min(elapsed / duration, 1.0)
+    y = round(from_y + span * ease(progress))
+    if not dispatch(f"hl.dsp.window.move({{ x = {x}, y = {y}, window = 'address:{address}' }})"):
+      return False
+    steps += 1
+    if progress >= 1.0:
+      break
+    # Sleep the remainder of this step, not a flat interval, so a slow dispatch
+    # eats into the next step instead of pushing the whole slide later.
+    time.sleep(max(STEP_SECONDS - (time.monotonic() - start - elapsed), 0))
+
+  # Land exactly on the target even if rounding never hit it, so the resting
+  # position never depends on how the last few steps fell.
+  if y != to_y:
+    dispatch(f"hl.dsp.window.move({{ x = {x}, y = {to_y}, window = 'address:{address}' }})")
+  return True
+
+
+def main(argv):
+  if len(argv) not in (5, 6):
+    print(f"usage: {os.path.basename(argv[0])} <address> <x> <from-y> <to-y> [duration-ms]", file=sys.stderr)
+    return 2
+
+  path = request_socket_path()
+  if not path or not os.path.exists(path):
+    print("agent-drawer-slide: no Hyprland request socket", file=sys.stderr)
+    return 1
+
+  address, x, from_y, to_y = argv[1], int(argv[2]), int(argv[3]), int(argv[4])
+  duration_ms = int(argv[5]) if len(argv) == 6 else 260
+  if duration_ms <= 0:
+    return 0
+
+  dispatch = Dispatcher(path)
+  if not slide(dispatch, address, x, from_y, to_y, duration_ms):
+    # The caller slides on the way out of view, so a failed slide still has to
+    # put the window where the next step expects it.
+    dispatch(f"hl.dsp.window.move({{ x = {x}, y = {to_y}, window = 'address:{address}' }})")
+    return 1
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main(sys.argv))

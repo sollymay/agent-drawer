@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "agent-drawer",
+  "name": "Agent Drawer",
+  "version": "1.0.0",
+  "author": "salomonmay",
+  "license": "MIT",
+  "description": "A floating default-agent TUI under the menubar, with a panel for its size, usage and toggle shortcut.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Drawer",
+    "description": "Left click opens the settings and usage panel. Right click slides the agent drawer in or out. Middle click restarts it.",
+    "category": "AI",
+    "aliases": ["agent", "drawer", "agent-tui"],
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "drawerWidthPct": 44,
+      "drawerHeightPct": 50,
+      "toggleKey": "SUPER + SHIFT + A"
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Usage refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 300 },
+      { "key": "drawerWidthPct", "type": "integer", "label": "Drawer width (% of screen)", "min": 10, "max": 100, "step": 1, "defaultValue": 44 },
+      { "key": "drawerHeightPct", "type": "integer", "label": "Drawer height (% of screen)", "min": 10, "max": 100, "step": 1, "defaultValue": 50 },
+      { "key": "toggleKey", "type": "string", "label": "Toggle shortcut", "defaultValue": "SUPER + SHIFT + A", "description": "Keys that slide the drawer in and out, in the form SUPER + SHIFT + A. Leave empty to switch the shortcut off. The binding is written to the marked region at the end of ~/.config/hypr/bindings.lua, replacing anything bound to the previous shortcut." }
+    ]
+  }
+}

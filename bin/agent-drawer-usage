@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Print the default agent's daily and weekly usage as one JSON record.
+
+The popup in Panel.qml reads only what this prints, so the collector and the
+panel stay decoupled: add a field here and it is available to the panel.
+
+Two data sources, picked by the default agent:
+
+  opencode  ~/.local/share/opencode/opencode.db, aggregated from the message
+            table's token JSON. Counts assistant messages only, since that is
+            where the token counts live.
+  anything  else  ~/.local/state/omarchy/agents/usage/<agent>.json, the shared
+            record Omarchy's own agents panel watches.
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+WEEK_DAYS = 7
+DEFAULT_AGENT = "opencode"
+
+
+def default_agent():
+  """Read the same setting omarchy-agent reads."""
+  cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy" / "defaults" / "agent"
+  try:
+    value = cfg.read_text().strip()
+  except OSError:
+    value = ""
+  if value:
+    return value
+  try:
+    return subprocess.run(["omarchy-default-agent"], capture_output=True, text=True, timeout=5).stdout.strip() or DEFAULT_AGENT
+  except (OSError, subprocess.SubprocessError):
+    return DEFAULT_AGENT
+
+
+def token_column(field):
+  return f"COALESCE(json_extract(data,'$.tokens.{field}'),0)"
+
+
+def collect_opencode(db_path):
+  record = empty_record("opencode", "OpenCode", "opencode.db")
+  if not db_path.exists():
+    record["note"] = f"No OpenCode database at {db_path}"
+    return record
+
+  now = int(time.time())
+  week_start = int((now - WEEK_DAYS * 86400) * 1000)
+
+  conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+  try:
+    conn.execute("PRAGMA query_only = ON")
+
+    day_sql = f"""
+      SELECT date(time_created/1000,'unixepoch','localtime') AS day,
+             COUNT(*)                                                   AS messages,
+             COUNT(DISTINCT session_id)                                  AS sessions,
+             SUM({token_column('input')})                               AS input,
+             SUM({token_column('output')})                              AS output,
+             SUM({token_column('reasoning')})                           AS reasoning,
+             SUM({token_column('cache.read')})                          AS cache_read,
+             SUM({token_column('cache.write')})                         AS cache_write,
+             SUM(COALESCE(json_extract(data,'$.cost'),0))              AS cost
+      FROM message
+      WHERE json_extract(data,'$.role') = 'assistant'
+      GROUP BY day
+    """
+    for row in conn.execute(day_sql):
+      day, messages, sessions, inp, outp, reasoning, cread, cwrite, cost = row
+      record["days"].append({
+        "date": day,
+        "messages": messages,
+        "sessions": sessions,
+        "input": inp,
+        "output": outp,
+        "reasoning": reasoning,
+        "cacheRead": cread,
+        "cacheWrite": cwrite,
+        "tokens": inp + outp + reasoning + cread + cwrite,
+        "cost": round(cost or 0.0, 4),
+      })
+
+    model_sql = f"""
+      SELECT COALESCE(json_extract(data,'$.providerID'),'?') || '/' ||
+             COALESCE(json_extract(data,'$.modelID'),'?')     AS model,
+             COUNT(*)                                         AS messages,
+             SUM({token_column('input')} + {token_column('output')} +
+                 {token_column('reasoning')} + {token_column('cache.read')} +
+                 {token_column('cache.write')})               AS tokens
+      FROM message
+      WHERE json_extract(data,'$.role') = 'assistant'
+      GROUP BY model
+      ORDER BY tokens DESC
+      LIMIT 6
+    """
+    record["models"] = [
+      {"id": model, "messages": messages, "tokens": tokens}
+      for model, messages, tokens in conn.execute(model_sql)
+    ]
+
+    record["totals"] = conn.execute(
+      f"""SELECT COUNT(*), COUNT(DISTINCT session_id),
+                 SUM({token_column('input')}), SUM({token_column('output')}),
+                 SUM({token_column('reasoning')}), SUM({token_column('cache.read')}),
+                 SUM({token_column('cache.write')}),
+                 SUM(COALESCE(json_extract(data,'$.cost'),0))
+          FROM message WHERE json_extract(data,'$.role') = 'assistant'"""
+    ).fetchone()
+  except sqlite3.Error as error:
+    record["available"] = False
+    record["note"] = f"OpenCode database could not be read: {error}"
+    return record
+  finally:
+    conn.close()
+
+  normalize_totals(record)
+  select_window(record, now)
+  record["available"] = any(day["messages"] for day in record["days"])
+  return record
+
+
+def collect_from_omarchy_record(agent, record_path):
+  """Read one of the shared records the agents panel already maintains."""
+  record = empty_record(agent, agent, record_path.name)
+  if not record_path.exists():
+    record["note"] = (
+      f"No usage record for {agent}. Omarchy writes one when the agent runs; "
+      "run `omarchy agent usage-update` to create it."
+    )
+    return record
+
+  try:
+    source = json.loads(record_path.read_text())
+  except (OSError, json.JSONDecodeError) as error:
+    record["note"] = f"Usage record could not be read: {error}"
+    return record
+
+  record["agentName"] = source.get("name") or agent
+  # Carry the collector's own status line through: "Waiting for auth" is the
+  # difference between a quiet agent and a broken one.
+  record["statusText"] = source.get("usageStatusText") or ""
+  record["authHelpText"] = source.get("authHelpText") or ""
+  # Shared records store tokens under messageCount, one entry per day.
+  for entry in source.get("recentDays") or []:
+    tokens = int(entry.get("messageCount") or 0)
+    record["days"].append({
+      "date": entry.get("date", ""),
+      "messages": tokens,
+      "sessions": 0,
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "tokens": tokens,
+      "cost": 0.0,
+    })
+
+  for model, bucket in (source.get("modelUsage") or {}).items():
+    tokens = sum(int(bucket.get(key) or 0) for key in (
+      "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
+    ))
+    record["models"].append({"id": model, "messages": 0, "tokens": tokens})
+
+  record["todaySessions"] = source.get("todaySessions") or 0
+  record["todayPrompts"] = source.get("todayPrompts") or 0
+  record["totalSessions"] = source.get("totalSessions") or 0
+  record["totalPrompts"] = source.get("totalPrompts") or 0
+  record["tierLabel"] = source.get("tierLabel") or ""
+  # Providers publish how much of a window is gone, as a 0..1 fraction, not as a
+  # token allowance, so there is no used/limit token ratio to hand the panel.
+  record["limits"] = [
+    {
+      "label": str(entry.get("label") or ""),
+      "percent": float(entry.get("percent") or 0),
+      "resetsAt": str(entry.get("resetsAt") or ""),
+    }
+    for entry in (source.get("limits") or [])
+    if isinstance(entry, dict)
+  ]
+  record["allTime"] = {
+    "days": source.get("activeDays") or 0,
+    "messages": source.get("totalPrompts") or 0,
+    "sessions": source.get("totalSessions") or 0,
+  }
+  # The shared record has no all-time token count, so say so rather than
+  # quietly reporting the week as a lifetime total.
+  record["totals"] = None
+  select_window(record, int(time.time()))
+  record["available"] = any(day["tokens"] for day in record["days"])
+  return record
+
+
+def empty_record(agent_id, agent_name, source):
+  return {
+    "schemaVersion": 1,
+    "agentId": agent_id,
+    "agentName": agent_name,
+    "source": source,
+    "collectedAt": int(time.time() * 1000),
+    "available": False,
+    "note": "",
+    "statusText": "",
+    "authHelpText": "",
+    "days": [],
+    "models": [],
+    "totals": None,
+    "limits": [],
+    "tierLabel": "",
+    "today": None,
+    "week": None,
+    "allTime": None,
+    "todayPrompts": None,
+    "todaySessions": None,
+    "totalPrompts": None,
+    "totalSessions": None,
+  }
+
+
+def normalize_totals(record):
+  messages, sessions, inp, outp, reasoning, cread, cwrite, cost = record["totals"]
+  record["totals"] = {
+    "messages": messages,
+    "sessions": sessions,
+    "input": inp,
+    "output": outp,
+    "reasoning": reasoning,
+    "cacheRead": cread,
+    "cacheWrite": cwrite,
+    "tokens": (inp or 0) + (outp or 0) + (reasoning or 0) + (cread or 0) + (cwrite or 0),
+    "cost": round(cost or 0.0, 4),
+  }
+  record["allTime"] = {
+    "days": len({day["date"] for day in record["days"] if day["date"]}),
+    "messages": messages,
+    "sessions": sessions,
+  }
+
+
+def select_window(record, now):
+  """Fill today/week and trim days to the last WEEK_DAYS entries."""
+  today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+  by_date = {day["date"]: day for day in record["days"] if day["date"]}
+
+  def blank(date):
+    return {
+      "date": date, "messages": 0, "sessions": 0, "input": 0, "output": 0,
+      "reasoning": 0, "cacheRead": 0, "cacheWrite": 0, "tokens": 0, "cost": 0.0,
+    }
+
+  record["days"] = [
+    by_date.get((datetime.fromtimestamp(now) - timedelta(days=offset)).strftime("%Y-%m-%d"), blank(
+      (datetime.fromtimestamp(now) - timedelta(days=offset)).strftime("%Y-%m-%d")))
+    for offset in reversed(range(WEEK_DAYS))
+  ]
+
+  def totals_of(days):
+    summed = {key: sum(day[key] for day in days) for key in
+              ("messages", "sessions", "input", "output", "reasoning",
+               "cacheRead", "cacheWrite", "tokens")}
+    summed["cost"] = round(sum(day["cost"] for day in days), 4)
+    return summed
+
+  record["today"] = totals_of([record["days"][-1]])
+  record["week"] = totals_of(record["days"])
+  record["week"]["from"] = record["days"][0]["date"]
+  record["week"]["to"] = record["days"][-1]["date"]
+
+
+def main():
+  agent = default_agent()
+  if agent == "opencode":
+    db = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+    record = collect_opencode(db)
+  else:
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    record = collect_from_omarchy_record(agent, state / "omarchy" / "agents" / "usage" / f"{agent}.json")
+
+  # Write through a temp file so a reader never sees a half-written record,
+  # and print the same bytes to stdout for callers that just want the JSON.
+  json.dump(record, sys.stdout)
+  sys.stdout.write("\n")
+
+  cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "agent-drawer"
+  try:
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=cache, delete=False, suffix=".json") as handle:
+      json.dump(record, handle)
+      os.replace(handle.name, cache / "usage.json")
+  except OSError:
+    pass
+
+
+if __name__ == "__main__":
+  main()
